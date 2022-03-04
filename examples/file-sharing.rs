@@ -78,12 +78,13 @@
 //! peer, as long as both are connected to some node on the same DHT.
 
 use async_std::io;
-use async_std::task::spawn;
+use async_std::task::{sleep, spawn};
 use futures::prelude::*;
 use libp2p::core::{Multiaddr, PeerId};
 use libp2p::multiaddr::Protocol;
 use std::error::Error;
 use std::path::PathBuf;
+use std::time::Duration;
 use structopt::StructOpt;
 
 #[async_std::main]
@@ -123,6 +124,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .expect("Dial to succeed");
     }
 
+    let closest_peers = network_client.get_closest_peers().await;
+    println!("CLOSEST PEERS: {:?}", closest_peers);
+
     match opt.argument {
         // Providing a file.
         CliArgument::Provide { path, name } => {
@@ -160,10 +164,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // Await the requests, ignore the remaining once a single one succeeds.
             let file = futures::future::select_ok(requests)
                 .await
-                .map_err(|_| "None of the providers returned file.")?
+                .map_err(|e| format!("None of the providers returned file. Reason: {:?}", e))?
                 .0;
 
             println!("Content of file {}: {}", name, file);
+        }
+        // Listening
+        CliArgument::Listen => {
+            loop {
+                match network_events.next().await {
+                    e => {
+                        println!("Received an event: {:?}", e);
+                        sleep(Duration::from_secs(1)).await;
+                    },
+                }
+            }
         }
     }
 
@@ -199,6 +214,7 @@ enum CliArgument {
         #[structopt(long)]
         name: String,
     },
+    Listen
 }
 
 /// The network module, encapsulating all network related logic.
@@ -208,10 +224,11 @@ mod network {
     use futures::channel::{mpsc, oneshot};
     use libp2p::core::either::EitherError;
     use libp2p::core::upgrade::{read_length_prefixed, write_length_prefixed, ProtocolName};
+    use libp2p::identify::{Identify, IdentifyConfig, IdentifyEvent};
     use libp2p::identity;
     use libp2p::identity::ed25519;
     use libp2p::kad::record::store::MemoryStore;
-    use libp2p::kad::{GetProvidersOk, Kademlia, KademliaEvent, QueryId, QueryResult};
+    use libp2p::kad::{GetClosestPeersOk, GetProvidersOk, Kademlia, KademliaEvent, QueryId, QueryResult};
     use libp2p::multiaddr::Protocol;
     use libp2p::request_response::{
         ProtocolSupport, RequestId, RequestResponse, RequestResponseCodec, RequestResponseEvent,
@@ -245,6 +262,7 @@ mod network {
             }
             None => identity::Keypair::generate_ed25519(),
         };
+        let identify_config = IdentifyConfig::new(String::from("ipfs/1.0.0"), id_keys.public().clone());
         let peer_id = id_keys.public().to_peer_id();
 
         // Build the Swarm, connecting the lower layer transport logic with the
@@ -258,6 +276,7 @@ mod network {
                     iter::once((FileExchangeProtocol(), ProtocolSupport::Full)),
                     Default::default(),
                 ),
+                identify: Identify::new(identify_config),
             },
             peer_id,
         )
@@ -269,6 +288,7 @@ mod network {
         Ok((
             Client {
                 sender: command_sender,
+                peer_id: peer_id,
             },
             event_receiver,
             EventLoop::new(swarm, command_receiver, event_sender),
@@ -278,6 +298,7 @@ mod network {
     #[derive(Clone)]
     pub struct Client {
         sender: mpsc::Sender<Command>,
+        peer_id: PeerId,
     }
 
     impl Client {
@@ -332,6 +353,16 @@ mod network {
             receiver.await.expect("Sender not to be dropped.")
         }
 
+        /// Find the closest peers for the given key.
+        pub async fn get_closest_peers(&mut self) -> HashSet<PeerId> {
+            let (sender, receiver) = oneshot::channel();
+            self.sender
+                .send(Command::GetClosestPeers { peer_id: self.peer_id, sender })
+                .await
+                .expect("Command receiver not to be dropped.");
+            receiver.await.expect("Sender not to be dropped.")
+        }
+
         /// Request the content of the given file from the given peer.
         pub async fn request_file(
             &mut self,
@@ -366,6 +397,7 @@ mod network {
         pending_dial: HashMap<PeerId, oneshot::Sender<Result<(), Box<dyn Error + Send>>>>,
         pending_start_providing: HashMap<QueryId, oneshot::Sender<()>>,
         pending_get_providers: HashMap<QueryId, oneshot::Sender<HashSet<PeerId>>>,
+        pending_get_closest_peers: HashMap<QueryId, oneshot::Sender<HashSet<PeerId>>>,
         pending_request_file:
             HashMap<RequestId, oneshot::Sender<Result<String, Box<dyn Error + Send>>>>,
     }
@@ -383,6 +415,7 @@ mod network {
                 pending_dial: Default::default(),
                 pending_start_providing: Default::default(),
                 pending_get_providers: Default::default(),
+                pending_get_closest_peers: Default::default(),
                 pending_request_file: Default::default(),
             }
         }
@@ -404,9 +437,10 @@ mod network {
             &mut self,
             event: SwarmEvent<
                 ComposedEvent,
-                EitherError<ConnectionHandlerUpgrErr<io::Error>, io::Error>,
+                impl Error,
             >,
         ) {
+            println!("HANDLE EVENT: {:?}", event);
             match event {
                 SwarmEvent::Behaviour(ComposedEvent::Kademlia(
                     KademliaEvent::OutboundQueryCompleted {
@@ -428,11 +462,26 @@ mod network {
                         ..
                     },
                 )) => {
+                    println!("PROVIDERS: {:?}", providers);
                     let _ = self
                         .pending_get_providers
                         .remove(&id)
                         .expect("Completed query to be previously pending.")
                         .send(providers);
+                }
+                SwarmEvent::Behaviour(ComposedEvent::Kademlia(
+                    KademliaEvent::OutboundQueryCompleted {
+                        id,
+                        result: QueryResult::GetClosestPeers(Ok(GetClosestPeersOk { key, peers })),
+                        ..
+                    },
+                )) => {
+                    println!("CLOSEST PEERS FOR KEY {:?}: {:?}", key, peers);
+                    let _ = self
+                        .pending_get_closest_peers
+                        .remove(&id)
+                        .expect("Completed query to be previously pending.")
+                        .send(HashSet::from_iter(peers));
                 }
                 SwarmEvent::Behaviour(ComposedEvent::Kademlia(_)) => {}
                 SwarmEvent::Behaviour(ComposedEvent::RequestResponse(
@@ -465,6 +514,7 @@ mod network {
                         request_id, error, ..
                     },
                 )) => {
+                    println!("OutboundFailure: {}", error);
                     let _ = self
                         .pending_request_file
                         .remove(&request_id)
@@ -480,6 +530,22 @@ mod network {
                         "Local node is listening on {:?}",
                         address.with(Protocol::P2p(local_peer_id.into()))
                     );
+                }
+                SwarmEvent::Behaviour(ComposedEvent::Identify(
+                    IdentifyEvent::Pushed { peer_id }
+                )) => {
+                    println!("Identify::Pushed: {}", peer_id);
+                }
+                SwarmEvent::Behaviour(ComposedEvent::Identify(
+                    IdentifyEvent::Sent { peer_id }
+                )) => {
+                    println!("Identify::Sent: {}", peer_id);
+                }
+                SwarmEvent::Behaviour(ComposedEvent::Identify(
+                    IdentifyEvent::Received { peer_id, info }
+                )) => {
+                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, info.listen_addrs.iter().next().unwrap().clone());
+                    println!("Identify::Received: {}; {:?}", peer_id, info);
                 }
                 SwarmEvent::IncomingConnection { .. } => {}
                 SwarmEvent::ConnectionEstablished {
@@ -498,6 +564,9 @@ mod network {
                             let _ = sender.send(Err(Box::new(error)));
                         }
                     }
+                }
+                SwarmEvent::Dialing(peer_id) => {
+                    println!("Dialing peer {:?}", peer_id);
                 }
                 e => panic!("{:?}", e),
             }
@@ -553,6 +622,14 @@ mod network {
                         .get_providers(file_name.into_bytes().into());
                     self.pending_get_providers.insert(query_id, sender);
                 }
+                Command::GetClosestPeers { peer_id, sender } => {
+                    let query_id = self
+                        .swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .get_closest_peers(peer_id);
+                    self.pending_get_closest_peers.insert(query_id, sender);
+                }
                 Command::RequestFile {
                     file_name,
                     peer,
@@ -581,12 +658,14 @@ mod network {
     struct ComposedBehaviour {
         request_response: RequestResponse<FileExchangeCodec>,
         kademlia: Kademlia<MemoryStore>,
+        identify: Identify,
     }
 
     #[derive(Debug)]
     enum ComposedEvent {
         RequestResponse(RequestResponseEvent<FileRequest, FileResponse>),
         Kademlia(KademliaEvent),
+        Identify(IdentifyEvent),
     }
 
     impl From<RequestResponseEvent<FileRequest, FileResponse>> for ComposedEvent {
@@ -598,6 +677,12 @@ mod network {
     impl From<KademliaEvent> for ComposedEvent {
         fn from(event: KademliaEvent) -> Self {
             ComposedEvent::Kademlia(event)
+        }
+    }
+
+    impl From<IdentifyEvent> for ComposedEvent {
+        fn from(event: IdentifyEvent) -> Self {
+            ComposedEvent::Identify(event)
         }
     }
 
@@ -620,6 +705,10 @@ mod network {
             file_name: String,
             sender: oneshot::Sender<HashSet<PeerId>>,
         },
+        GetClosestPeers {
+            peer_id: PeerId,
+            sender: oneshot::Sender<HashSet<PeerId>>,
+        },
         RequestFile {
             file_name: String,
             peer: PeerId,
@@ -631,6 +720,7 @@ mod network {
         },
     }
 
+    #[derive(Debug)]
     pub enum Event {
         InboundRequest {
             request: String,
